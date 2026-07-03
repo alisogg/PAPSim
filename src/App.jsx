@@ -272,8 +272,8 @@ let idCounter = 1;
 const nextId = () => `n${idCounter++}`;
 
 // Large free-form canvas: bigger than the viewport, scrollable in both directions
-const CANVAS_W = 2200;
-const CANVAS_H = 1300;
+const CANVAS_W = 1700;
+const CANVAS_H = 900;
 const CANVAS_VIEW_H = 520; // visible viewport height before scroll kicks in
 
 function EditorNode({ node, selected, onPointerDown, onClick }) {
