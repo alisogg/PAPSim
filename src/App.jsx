@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import * as XLSX from "xlsx";
 
 const COLORS = {
@@ -207,58 +207,6 @@ const STEPS = {
   ],
 };
 
-const RESULTS = {
-  1: {
-    stats: { llegadas: 50, salidas: 43, uso: 84 },
-    metrics: [
-      { key: "Tiempo de espera", value: "10,5", unit: "min", sub: "Promedio en cola", color: COLORS.blue },
-      { key: "Clientes atendidos", value: "43", unit: "", sub: "de 50 llegadas", color: COLORS.blue },
-      { key: "Utilización servidor", value: "84,0", unit: "%", sub: "Uso del servidor", color: COLORS.green, bar: 84 },
-      { key: "Tiempo en sistema", value: "12,5", unit: "min", sub: "Espera + servicio", color: COLORS.blue },
-    ],
-    headers: ["Cliente", "Llegada", "Inicio Serv.", "Fin Serv.", "Espera"],
-    rows: [
-      ["Cliente 1", "0,0", "0,0", "2,3", "• 0,0"],
-      ["Cliente 2", "2,8", "2,8", "5,1", "• 0,0"],
-      ["Cliente 3", "4,1", "5,1", "7,4", "• 1,0"],
-      ["Cliente 4", "5,9", "7,4", "9,7", "• 1,5"],
-      ["Cliente 5", "7,3", "9,7", "11,8", "• 2,4"],
-    ],
-  },
-  2: {
-    stats: { llegadas: 40, salidas: 37, uso: 76 },
-    metrics: [
-      { key: "Tiempo total prom.", value: "5,8", unit: "min", sub: "Por cliente", color: COLORS.blue },
-      { key: "Clientes atendidos", value: "37", unit: "", sub: "de 40 llegadas", color: COLORS.blue },
-      { key: "Utilización taquilla", value: "76,0", unit: "%", sub: "Cuello de botella", color: COLORS.green, bar: 76 },
-      { key: "Tiempo en sistema", value: "8,2", unit: "min", sub: "Espera + servicio", color: COLORS.blue },
-    ],
-    headers: ["Cliente", "Llegada", "Fin Taq.", "Fin Rev.", "Fin Ent.", "T.Total"],
-    rows: [
-      ["Cliente 1", "0,0", "1,8", "2,4", "2,9", "5,1"],
-      ["Cliente 2", "2,6", "4,4", "5,0", "5,5", "7,9"],
-      ["Cliente 3", "5,1", "6,3", "7,1", "7,6", "9,4"],
-    ],
-  },
-  3: {
-    stats: { llegadas: 50, salidas: 48, uso: 80 },
-    metrics: [
-      { key: "T. prom. con dulces", value: "6,3", unit: "min", sub: "55% de clientes", color: COLORS.yellow },
-      { key: "T. prom. sin dulces", value: "3,9", unit: "min", sub: "45% de clientes", color: COLORS.blue },
-      { key: "Utilización taquilla", value: "80,0", unit: "%", sub: "Uso del servidor", color: COLORS.green, bar: 80 },
-      { key: "W prom. ponderado", value: "5,2", unit: "min", sub: "Espera + servicio", color: COLORS.blue },
-    ],
-    headers: ["Cliente", "Llegada", "Fin Taq.", "¿Dulces?", "Fin Dulc.", "Salida"],
-    rows: [
-      ["Cliente 1", "0,0", "2,1", "Sí", "4,5", "6,6"],
-      ["Cliente 2", "1,4", "3,7", "No", "—", "4,8"],
-      ["Cliente 3", "3,2", "5,9", "Sí", "8,4", "9,7"],
-      ["Cliente 4", "5,0", "7,3", "No", "—", "6,8"],
-      ["Cliente 5", "6,8", "9,2", "Sí", "12,1", "13,4"],
-    ],
-  },
-};
-
 // ─── EDITOR: free modeling node kinds ─────────────────────────────────────────
 
 const PALETTE = [
@@ -272,8 +220,8 @@ let idCounter = 1;
 const nextId = () => `n${idCounter++}`;
 
 // Large free-form canvas: bigger than the viewport, scrollable in both directions
-const CANVAS_W = 1700;
-const CANVAS_H = 500;
+const CANVAS_W = 1200;
+const CANVAS_H = 800;
 const CANVAS_VIEW_H = 520; // visible viewport height before scroll kicks in
 
 function EditorNode({ node, selected, onPointerDown, onClick }) {
@@ -440,10 +388,144 @@ function EjemploDetalle({ caso, onBack }) {
   const [filterEspera, setFilterEspera] = useState(false);
 
   const steps = STEPS[caso] || [];
-  const results = RESULTS[caso];
   const DiagramComp = DIAGRAMS[caso];
   const casoMeta = CASOS.find((c) => c.id === caso);
   const casoLabel = `${casoMeta?.label} — ${casoMeta?.title}`;
+
+  // ── Real simulation engine, driven by the user's input parameters ──
+  const results = useMemo(() => {
+    const meanArrival = Math.max(0.1, parseFloat(llegada) || 8);
+    const meanService = Math.max(0.1, parseFloat(servicio) || 12);
+    const numServers = Math.max(1, parseInt(servidores) || 1);
+    const simMinutes = Math.max(1, parseFloat(tSim) || 120);
+    const pDulces = Math.max(0, Math.min(1, parseFloat(prob) || 0.5));
+
+    // deterministic pseudo-random spacing so results are reproducible per input set
+    const jitter = (seed, spread = 0.8) => 0.6 + (((seed * 53) % 100) / 100) * spread;
+
+    const maxClients = Math.min(300, Math.ceil(simMinutes / meanArrival) + 5);
+    const serverFreeAt = new Array(numServers).fill(0); // for the bottleneck activity
+
+    let arrivalClock = 0;
+    const rows = [];
+    let totalWait = 0;
+    let served = 0;
+    let busyTime = 0;
+
+    if (caso === 1) {
+      // Single activity M/M/c
+      for (let i = 1; i <= maxClients; i++) {
+        arrivalClock += meanArrival * jitter(i);
+        if (arrivalClock > simMinutes) break;
+        const serverIdx = serverFreeAt.indexOf(Math.min(...serverFreeAt));
+        const start = Math.max(arrivalClock, serverFreeAt[serverIdx]);
+        const dur = meanService * jitter(i * 7, 0.5);
+        const end = start + dur / numServers;
+        serverFreeAt[serverIdx] = end;
+        const wait = start - arrivalClock;
+        totalWait += wait;
+        busyTime += dur / numServers;
+        served += 1;
+        if (rows.length < 8) {
+          rows.push([`Cliente ${i}`, arrivalClock.toFixed(1), start.toFixed(1), end.toFixed(1), `• ${wait.toFixed(1)}`]);
+        }
+      }
+      const avgWait = served ? totalWait / served : 0;
+      const util = Math.min(100, (busyTime / simMinutes) * 100);
+      return {
+        stats: { llegadas: Math.min(maxClients, served + Math.max(0, maxClients - served)), salidas: served, uso: Math.round(util) },
+        metrics: [
+          { key: "Tiempo de espera", value: avgWait.toFixed(1).replace(".", ","), unit: "min", sub: "Promedio en cola", color: COLORS.blue },
+          { key: "Clientes atendidos", value: String(served), unit: "", sub: `de ${served} llegadas`, color: COLORS.blue },
+          { key: "Utilización servidor", value: util.toFixed(1).replace(".", ","), unit: "%", sub: "Uso del servidor", color: COLORS.green, bar: Math.round(util) },
+          { key: "Tiempo en sistema", value: (avgWait + meanService / numServers).toFixed(1).replace(".", ","), unit: "min", sub: "Espera + servicio", color: COLORS.blue },
+        ],
+        headers: ["Cliente", "Llegada", "Inicio Serv.", "Fin Serv.", "Espera"],
+        rows,
+      };
+    }
+
+    if (caso === 2) {
+      // Three activities in series: Taquilla -> Revisión -> Entrada
+      const revServ = meanService * 0.4;
+      const entServ = meanService * 0.3;
+      let taqFree = 0;
+      for (let i = 1; i <= maxClients; i++) {
+        arrivalClock += meanArrival * jitter(i);
+        if (arrivalClock > simMinutes) break;
+        const taqStart = Math.max(arrivalClock, taqFree);
+        const taqDur = meanService * jitter(i * 7, 0.5) / numServers;
+        const taqEnd = taqStart + taqDur;
+        taqFree = taqEnd;
+        const revEnd = taqEnd + revServ * jitter(i * 11, 0.4);
+        const entEnd = revEnd + entServ * jitter(i * 13, 0.4);
+        const total = entEnd - arrivalClock;
+        totalWait += total;
+        busyTime += taqDur;
+        served += 1;
+        if (rows.length < 8) {
+          rows.push([`Cliente ${i}`, arrivalClock.toFixed(1), taqEnd.toFixed(1), revEnd.toFixed(1), entEnd.toFixed(1), total.toFixed(1)]);
+        }
+      }
+      const avgTotal = served ? totalWait / served : 0;
+      const util = Math.min(100, (busyTime / simMinutes) * 100);
+      return {
+        stats: { llegadas: served, salidas: served, uso: Math.round(util) },
+        metrics: [
+          { key: "Tiempo total prom.", value: avgTotal.toFixed(1).replace(".", ","), unit: "min", sub: "Por cliente", color: COLORS.blue },
+          { key: "Clientes atendidos", value: String(served), unit: "", sub: `de ${served} llegadas`, color: COLORS.blue },
+          { key: "Utilización taquilla", value: util.toFixed(1).replace(".", ","), unit: "%", sub: "Cuello de botella", color: COLORS.green, bar: Math.round(util) },
+          { key: "Tiempo en sistema", value: avgTotal.toFixed(1).replace(".", ","), unit: "min", sub: "Espera + servicio", color: COLORS.blue },
+        ],
+        headers: ["Cliente", "Llegada", "Fin Taq.", "Fin Rev.", "Fin Ent.", "T.Total"],
+        rows,
+      };
+    }
+
+    // caso === 3: Taquilla -> XOR gateway -> (Comprar dulces | Ir a sala)
+    let taqFree = 0;
+    let withCandyWaits = [];
+    let withoutCandyWaits = [];
+    for (let i = 1; i <= maxClients; i++) {
+      arrivalClock += meanArrival * jitter(i);
+      if (arrivalClock > simMinutes) break;
+      const taqStart = Math.max(arrivalClock, taqFree);
+      const taqDur = meanService * jitter(i * 7, 0.5) / numServers;
+      const taqEnd = taqStart + taqDur;
+      taqFree = taqEnd;
+      busyTime += taqDur;
+      const wantsCandy = (((i * 37) % 100) / 100) < pDulces;
+      let salida;
+      if (wantsCandy) {
+        const candyDur = meanService * 0.8 * jitter(i * 17, 0.5);
+        salida = taqEnd + candyDur;
+        withCandyWaits.push(salida - arrivalClock);
+      } else {
+        salida = taqEnd;
+        withoutCandyWaits.push(salida - arrivalClock);
+      }
+      served += 1;
+      if (rows.length < 8) {
+        rows.push([`Cliente ${i}`, arrivalClock.toFixed(1), taqEnd.toFixed(1), wantsCandy ? "Sí" : "No", wantsCandy ? salida.toFixed(1) : "—", salida.toFixed(1)]);
+      }
+    }
+    const avgCandy = withCandyWaits.length ? withCandyWaits.reduce((a, b) => a + b, 0) / withCandyWaits.length : 0;
+    const avgNoCandy = withoutCandyWaits.length ? withoutCandyWaits.reduce((a, b) => a + b, 0) / withoutCandyWaits.length : 0;
+    const util = Math.min(100, (busyTime / simMinutes) * 100);
+    const allWaits = [...withCandyWaits, ...withoutCandyWaits];
+    const wAvg = allWaits.length ? allWaits.reduce((a, b) => a + b, 0) / allWaits.length : 0;
+    return {
+      stats: { llegadas: served, salidas: served, uso: Math.round(util) },
+      metrics: [
+        { key: "T. prom. con dulces", value: avgCandy.toFixed(1).replace(".", ","), unit: "min", sub: `${served ? Math.round((withCandyWaits.length / served) * 100) : 0}% de clientes`, color: COLORS.yellow },
+        { key: "T. prom. sin dulces", value: avgNoCandy.toFixed(1).replace(".", ","), unit: "min", sub: `${served ? Math.round((withoutCandyWaits.length / served) * 100) : 0}% de clientes`, color: COLORS.blue },
+        { key: "Utilización taquilla", value: util.toFixed(1).replace(".", ","), unit: "%", sub: "Uso del servidor", color: COLORS.green, bar: Math.round(util) },
+        { key: "W prom. ponderado", value: wAvg.toFixed(1).replace(".", ","), unit: "min", sub: "Espera + servicio", color: COLORS.blue },
+      ],
+      headers: ["Cliente", "Llegada", "Fin Taq.", "¿Dulces?", "Fin Dulc.", "Salida"],
+      rows,
+    };
+  }, [caso, llegada, servicio, servidores, prob, tSim]);
 
   useEffect(() => {
     setActiveNode(null);
@@ -689,6 +771,7 @@ function EditorView() {
   const [simDone, setSimDone] = useState(false);
   const [simRows, setSimRows] = useState([]);
   const [simError, setSimError] = useState("");
+  const [simAggregates, setSimAggregates] = useState(null);
   const svgRef = useRef(null);
   const dragRef = useRef(null); // { id, offsetX, offsetY }
   const suppressNextClickRef = useRef(false);
@@ -838,24 +921,39 @@ function EditorView() {
       return;
     }
 
-    const outgoing = (id) => edges.filter((e) => e.from === id).map((e) => nodes.find((n) => n.id === e.to)).filter(Boolean);
+    const outgoing = (id) =>
+      edges.filter((e) => e.from === id).map((e) => nodes.find((n) => n.id === e.to)).filter(Boolean);
 
-    const simMinutes = parseFloat(tSim) || 0;
+    const simMinutes = parseFloat(tSim) || 120;
+
+    // Track each activity node's server availability: activityFreeAt[nodeId] = time
+    const activityFreeAt = {};
+    nodes.filter((n) => n.kind === "actividad").forEach((n) => {
+      const servers = Math.max(1, parseInt(n.servidores) || 1);
+      activityFreeAt[n.id] = new Array(servers).fill(0);
+    });
+
     const rows = [];
     let clientCounter = 0;
+    let totalWait = 0;
+    let totalSystem = 0;
+    let totalBusy = {}; // nodeId -> accumulated busy time
+    nodes.filter((n) => n.kind === "actividad").forEach((n) => { totalBusy[n.id] = 0; });
 
     starts.forEach((start) => {
       const meanArrival = parseFloat(start.llegada) || 5;
-      const maxClients = meanArrival > 0 ? Math.max(1, Math.min(200, Math.ceil(simMinutes / meanArrival))) : 1;
+      const maxClients = meanArrival > 0
+        ? Math.max(1, Math.min(200, Math.ceil(simMinutes / meanArrival)))
+        : 1;
 
       let arrivalClock = 0;
       for (let i = 0; i < maxClients; i++) {
         clientCounter += 1;
-        // exponential-ish spacing using the configured mean (deterministic jitter, no RNG dependency issues)
         arrivalClock += meanArrival * (0.6 + (((clientCounter * 53) % 80) / 100));
         if (arrivalClock > simMinutes) break;
 
         let t = arrivalClock;
+        let clientWait = 0;
         const path = [`Inicio (${start.label})`];
         let current = start;
         let guard = 0;
@@ -878,27 +976,39 @@ function EditorView() {
 
           if (nextNode.kind === "actividad") {
             const servicio = parseFloat(nextNode.servicio) || 5;
-            const servidores = Math.max(1, parseInt(nextNode.servidores) || 1);
-            const tInicio = t;
-            const tFin = t + servicio / servidores;
-            path.push(`${nextNode.label} (${tInicio.toFixed(1)}→${tFin.toFixed(1)})`);
+            const serverSlots = activityFreeAt[nextNode.id] || [0];
+            // Pick the earliest free server
+            const earliest = Math.min(...serverSlots);
+            const slotIdx = serverSlots.indexOf(earliest);
+            const waitHere = Math.max(0, earliest - t);
+            clientWait += waitHere;
+            const tInicio = Math.max(t, earliest);
+            const tFin = tInicio + servicio * (0.7 + (((clientCounter * 31 + guard * 7) % 60) / 100));
+            serverSlots[slotIdx] = tFin;
+            if (totalBusy[nextNode.id] !== undefined) totalBusy[nextNode.id] += tFin - tInicio;
+            path.push(`${nextNode.label} (espera ${waitHere.toFixed(1)} → serv ${(tFin - tInicio).toFixed(1)})`);
             t = tFin;
           } else if (nextNode.kind === "fin") {
-            path.push(`${nextNode.label} (${t.toFixed(1)})`);
+            path.push(`${nextNode.label} (t=${t.toFixed(1)})`);
             current = nextNode;
             break;
           } else if (nextNode.kind === "compuerta") {
-            path.push(`${nextNode.label}`);
+            path.push(`Comp. ${nextNode.label}`);
           }
           current = nextNode;
           if (current.kind === "fin") break;
         }
 
+        const systemTime = t - arrivalClock;
+        totalWait += clientWait;
+        totalSystem += systemTime;
+
         rows.push({
           cliente: `Cliente ${clientCounter}`,
           llegada: arrivalClock.toFixed(1),
+          espera: clientWait.toFixed(1),
           salida: t.toFixed(1),
-          tiempoTotal: (t - arrivalClock).toFixed(1),
+          tiempoTotal: systemTime.toFixed(1),
           rama: branch,
           recorrido: path.join(" → "),
         });
@@ -907,6 +1017,8 @@ function EditorView() {
 
     setSimRows(rows);
     setSimDone(true);
+    // Store aggregates for metrics panel
+    setSimAggregates({ totalWait, totalSystem, totalBusy, clientCount: rows.length });
   };
 
   const handleSimulate = () => {
@@ -919,25 +1031,63 @@ function EditorView() {
   };
 
   const simMetrics = (() => {
-    if (!simDone || simRows.length === 0) return null;
-    const tiempos = simRows.map((r) => parseFloat(r.tiempoTotal));
-    const promedio = tiempos.reduce((a, b) => a + b, 0) / tiempos.length;
-    const actividades = nodes.filter((n) => n.kind === "actividad").length;
-    return {
-      clientes: simRows.length,
-      promedio: promedio.toFixed(1),
-      actividades,
-      compuertas: nodes.filter((n) => n.kind === "compuerta").length,
-    };
+    if (!simDone || !simAggregates || simRows.length === 0) return null;
+    const { totalWait, totalSystem, totalBusy, clientCount } = simAggregates;
+    const avgWait = clientCount ? totalWait / clientCount : 0;
+    const avgSystem = clientCount ? totalSystem / clientCount : 0;
+    const simMin = parseFloat(tSim) || 120;
+    // Utilization: average across all activity nodes
+    const actNodes = nodes.filter((n) => n.kind === "actividad");
+    const utilValues = actNodes.map((n) => {
+      const busy = totalBusy[n.id] || 0;
+      const servers = Math.max(1, parseInt(n.servidores) || 1);
+      return Math.min(100, (busy / (simMin * servers)) * 100);
+    });
+    const avgUtil = utilValues.length
+      ? utilValues.reduce((a, b) => a + b, 0) / utilValues.length
+      : 0;
+    return [
+      { key: "Tiempo de espera", value: avgWait.toFixed(1).replace(".", ","), unit: "min", sub: "Promedio en cola", color: COLORS.blue },
+      { key: "Clientes atendidos", value: String(clientCount), unit: "", sub: `en ${simMin} min simulados`, color: COLORS.blue },
+      { key: "Utilización promedio", value: avgUtil.toFixed(1).replace(".", ","), unit: "%", sub: "Media de actividades", color: COLORS.green, bar: Math.round(avgUtil) },
+      { key: "Tiempo en sistema", value: avgSystem.toFixed(1).replace(".", ","), unit: "min", sub: "Espera + servicio", color: COLORS.blue },
+    ];
   })();
 
   const handleExport = () => {
+    // Calculate metrics directly from simRows to ensure they're always available
+    let metricsData = [];
+    if (simRows.length > 0) {
+      const totalWait = simRows.reduce((sum, r) => sum + parseFloat(r.espera), 0);
+      const totalSystem = simRows.reduce((sum, r) => sum + parseFloat(r.tiempoTotal), 0);
+      const avgWait = (totalWait / simRows.length).toFixed(1).replace(".", ",");
+      const avgSystem = (totalSystem / simRows.length).toFixed(1).replace(".", ",");
+      const simMin = parseFloat(tSim) || 120;
+      const actNodes = nodes.filter((n) => n.kind === "actividad");
+      // Simple utilization estimate from service times
+      const avgServiceTime = simRows.reduce((sum, r) => {
+        const parts = r.recorrido.match(/serv ([\d.]+)/g) || [];
+        const serviceSum = parts.reduce((s, p) => s + parseFloat(p.replace(/[^\d.]/g, "")), 0);
+        return sum + serviceSum;
+      }, 0) / simRows.length;
+      const util = Math.min(100, (avgServiceTime / (simMin / simRows.length)) * 100);
+      
+      metricsData = [
+        ["MÉTRICAS DE SIMULACIÓN"],
+        ["Tiempo de espera", `${avgWait} min`],
+        ["Clientes atendidos", String(simRows.length)],
+        ["Utilización promedio", `${util.toFixed(1).replace(".", ",")} %`],
+        ["Tiempo en sistema", `${avgSystem} min`],
+        [],
+      ];
+    }
+
     const data = [
       ["PROCSIM — Modelo libre (Editor)"],
       [],
-      ["NODOS"],
-      ["ID", "Tipo", "Etiqueta", "T. llegadas", "T. servicio", "Servidores", "Prob."],
-      ...nodes.map((n) => [n.id, n.kind, n.label, n.llegada || "", n.servicio || "", n.servidores || "", n.prob || ""]),
+      ["PARÁMETROS DEL MODELO"],
+      ["Nodo", "Tipo", "T. llegadas (min)", "T. servicio (min)", "Servidores", "Prob."],
+      ...nodes.map((n) => [n.label, n.kind, n.llegada || "—", n.servicio || "—", n.servidores || "—", n.prob || "—"]),
       [],
       ["CONEXIONES"],
       ["Desde", "Hacia"],
@@ -949,14 +1099,15 @@ function EditorView() {
       [],
       ["T. simulación (min)", tSim],
       [],
-      ["RESULTADOS DE LA SIMULACIÓN"],
-      ["Cliente", "Llegada", "Salida", "T. total", "Rama", "Recorrido"],
-      ...simRows.map((r) => [r.cliente, r.llegada, r.salida, r.tiempoTotal, r.rama, r.recorrido]),
+      ...metricsData,
+      ["TRAZA DE EVENTOS"],
+      ["Cliente", "Llegada (min)", "Espera cola (min)", "Salida (min)", "T. en sistema (min)", "Rama", "Recorrido"],
+      ...simRows.map((r) => [r.cliente, r.llegada, r.espera, r.salida, r.tiempoTotal, r.rama || "—", r.recorrido]),
     ];
     const ws = XLSX.utils.aoa_to_sheet(data);
-    ws["!cols"] = [{ wch: 22 }, { wch: 16 }, { wch: 20 }, { wch: 14 }, { wch: 14 }, { wch: 12 }, { wch: 10 }];
+    ws["!cols"] = [{ wch: 26 }, { wch: 18 }, { wch: 18 }, { wch: 16 }, { wch: 20 }, { wch: 10 }, { wch: 60 }];
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Modelo");
+    XLSX.utils.book_append_sheet(wb, ws, "Simulación");
     XLSX.writeFile(wb, "procsim_editor.xlsx");
   };
 
@@ -1230,24 +1381,23 @@ function EditorView() {
         <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
           {simMetrics && (
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-              <div style={{ background: COLORS.white, borderRadius: 12, border: `1px solid ${COLORS.border}`, padding: "18px 20px" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
-                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: COLORS.blue, display: "inline-block" }} />
-                  <span style={{ fontSize: 12, color: COLORS.textSecondary }}>Clientes simulados</span>
+              {simMetrics.map(({ key, value, unit, sub, color, bar }) => (
+                <div key={key} style={{ background: COLORS.white, borderRadius: 12, border: `1px solid ${COLORS.border}`, padding: "18px 20px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: color, display: "inline-block" }} />
+                    <span style={{ fontSize: 12, color: COLORS.textSecondary }}>{key}</span>
+                  </div>
+                  <div style={{ fontSize: 28, fontWeight: 700, color: COLORS.textPrimary, lineHeight: 1 }}>
+                    {value}<span style={{ fontSize: 14, fontWeight: 400, color: COLORS.textSecondary, marginLeft: 3 }}>{unit}</span>
+                  </div>
+                  {bar !== undefined && (
+                    <div style={{ marginTop: 10, background: COLORS.border, borderRadius: 4, height: 5 }}>
+                      <div style={{ width: `${bar}%`, height: "100%", background: COLORS.green, borderRadius: 4 }} />
+                    </div>
+                  )}
+                  <div style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 6 }}>{sub}</div>
                 </div>
-                <div style={{ fontSize: 28, fontWeight: 700, color: COLORS.textPrimary, lineHeight: 1 }}>{simMetrics.clientes}</div>
-                <div style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 6 }}>Atravesaron el modelo</div>
-              </div>
-              <div style={{ background: COLORS.white, borderRadius: 12, border: `1px solid ${COLORS.border}`, padding: "18px 20px" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
-                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: COLORS.blue, display: "inline-block" }} />
-                  <span style={{ fontSize: 12, color: COLORS.textSecondary }}>Tiempo total promedio</span>
-                </div>
-                <div style={{ fontSize: 28, fontWeight: 700, color: COLORS.textPrimary, lineHeight: 1 }}>
-                  {simMetrics.promedio}<span style={{ fontSize: 14, fontWeight: 400, color: COLORS.textSecondary, marginLeft: 3 }}>min</span>
-                </div>
-                <div style={{ fontSize: 11, color: COLORS.textMuted, marginTop: 6 }}>Desde llegada hasta salida</div>
-              </div>
+              ))}
             </div>
           )}
 
@@ -1299,7 +1449,7 @@ function EditorView() {
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead>
             <tr style={{ background: COLORS.panel }}>
-              {["Cliente", "Llegada", "Salida", "T. total", "Rama", "Recorrido"].map((h) => (
+              {["Cliente", "Llegada", "Espera cola", "Salida", "T. sistema", "Rama", "Recorrido"].map((h) => (
                 <th key={h} style={{ padding: "10px 24px", textAlign: "left", fontSize: 11, color: COLORS.textMuted, fontWeight: 600, letterSpacing: 0.5, textTransform: "uppercase" }}>{h}</th>
               ))}
             </tr>
@@ -1309,10 +1459,11 @@ function EditorView() {
               <tr key={i} style={{ borderTop: `1px solid ${COLORS.border}` }}>
                 <td style={{ padding: "12px 24px", fontSize: 13, fontWeight: 500, color: COLORS.textPrimary }}>{r.cliente}</td>
                 <td style={{ padding: "12px 24px", fontSize: 13, color: COLORS.textSecondary }}>{r.llegada}</td>
+                <td style={{ padding: "12px 24px", fontSize: 13, color: parseFloat(r.espera) > 0 ? COLORS.yellow : COLORS.green, fontWeight: 600 }}>● {r.espera}</td>
                 <td style={{ padding: "12px 24px", fontSize: 13, color: COLORS.textSecondary }}>{r.salida}</td>
                 <td style={{ padding: "12px 24px", fontSize: 13, color: COLORS.green, fontWeight: 600 }}>● {r.tiempoTotal}</td>
                 <td style={{ padding: "12px 24px", fontSize: 13, color: r.rama === "Sí" ? COLORS.yellow : COLORS.textSecondary }}>{r.rama || "—"}</td>
-                <td style={{ padding: "12px 24px", fontSize: 12, color: COLORS.textMuted, fontFamily: "JetBrains Mono, monospace" }}>{r.recorrido}</td>
+                <td style={{ padding: "12px 24px", fontSize: 12, color: COLORS.textMuted, fontFamily: "JetBrains Mono, monospace", maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.recorrido}</td>
               </tr>
             ))}
             {simRows.length === 0 && (
